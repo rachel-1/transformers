@@ -1151,3 +1151,139 @@ class BertForQuestionAnswering(BertPreTrainedModel):
             outputs = (total_loss,) + outputs
 
         return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+class BertForVQR(BertPreTrainedModel):
+    def __init__(self, config, num_labels=2, q_relevance=True, r_relevance=True, answer_extraction=True, answer_verification=False):
+        super(BertForVQR, self).__init__(config)
+        self.num_labels = num_labels
+        self.bert = BertModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        # set up which tasks the network will do
+        self.q_relevance = q_relevance
+        self.r_relevance = r_relevance
+        self.answer_extraction = answer_extraction
+        self.answer_verification = answer_verification
+
+        if self.q_relevance:
+            self.q_relevance_classifier = nn.Linear(config.hidden_size, num_labels)
+        if self.r_relevance:
+            self.r_relevance_classifier = nn.Linear(config.hidden_size, num_labels)
+        if self.answer_extraction:
+            self.span_classifier = nn.Linear(config.hidden_size, 2)
+        if self.answer_verification:
+            from preprocessing.restate_questions import QA2D
+            from preprocessing.language_modeling import MaskedLM
+            self.qa2d = QA2D()
+            self.lm = MaskedLM()
+            self.loss_multiplier = nn.Parameter(torch.tensor(0.1))
+            self.loss_bias = nn.Parameter(torch.tensor(-1.0))
+        #self.apply(self.init_bert_weights)
+        self.init_weights()
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None,
+                q_relevance_ids=None, r_relevance_ids=None,
+                start_positions=None, end_positions=None, original_examples=None):
+        output = self.bert(input_ids, attention_mask, token_type_ids)#, output_all_encoded_layers=False)
+        encoded_layers, pooled_output = output
+
+        def classify_confusion(input_type='r', weighting=[1,1], answer_span_loss=None):
+            if input_type == 'r':
+                logits = self.r_relevance_classifier(self.dropout(pooled_output))
+                labels = r_relevance_ids
+            elif input_type == 'q':
+                logits = self.q_relevance_classifier(self.dropout(pooled_output))
+                labels = q_relevance_ids
+
+            loss = 0
+            if labels is not None:
+                weights = labels.new(weighting).float()
+                if self.num_labels > 1:
+                    loss_fct = CrossEntropyLoss(weight=weights)
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                else:
+                    loss_fct = BCEWithLogitsLoss(weight=weights)
+                    loss = loss_fct(logits.view(-1), labels.view(-1).float())
+
+            if self.num_labels == 1:
+                logits = nn.functional.sigmoid(logits)
+            else:
+                logits = torch.nn.functional.softmax(logits, dim=1)
+                if answer_span_loss is not None:
+                    logit_adjustment = self.loss_multiplier*torch.stack([torch.zeros_like(answer_span_loss), answer_span_loss], dim=1)
+                    logit_adjustment[:, 1] = logit_adjustment[:, 1] + self.loss_bias
+                    logit_adjustment = logit_adjustment.where(answer_span_loss.view(-1, 1) != -1, answer_span_loss.new([[0, 0]]))
+                    logits = logits + logit_adjustment
+                    logits = torch.nn.functional.softmax(logits, dim=1)
+            return loss, logits
+
+        def extract_answer(loss_mask=None):
+            logits = self.span_classifier(encoded_layers)
+            start_logits, end_logits = logits.split(1, dim=-1)
+            start_logits = start_logits.squeeze(-1)
+            end_logits = end_logits.squeeze(-1)
+            total_loss = 0
+            if start_positions is not None and end_positions is not None:
+                # ignore start/end positions outside model inputs
+                ignored_index = start_logits.size(1)
+                # avoid modifying input
+                tmp_start_positions = start_positions.clamp(0, ignored_index)
+                tmp_end_positions = end_positions.clamp(0, ignored_index)
+
+                #loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+                loss_fct = CrossEntropyLoss(reduction='none', ignore_index=ignored_index)
+                start_loss = loss_fct(start_logits, tmp_start_positions)
+                end_loss = loss_fct(end_logits, tmp_end_positions)
+                if loss_mask is not None:
+                    start_loss = torch.where(loss_mask == 1, torch.zeros_like(start_loss), start_loss)
+                    end_loss = torch.where(loss_mask == 1, torch.zeros_like(end_loss), end_loss)
+                    
+                total_loss = torch.mean(start_loss + end_loss)
+            return total_loss, start_logits, end_logits
+        
+        q_loss, r_loss, span_loss = 0, 0, 0
+        retvals = {}
+        if self.q_relevance:
+            # it's 3x more likely that a question is valid
+            q_loss, q_logits = classify_confusion('q', weighting=[1,3])
+            retvals['q_logits'] = q_logits
+
+            # determine if the question is valid TODO
+            # if q invalid, rerun over "what is in the image?"
+            #invalid_qs = torch.where(q_relevance_ids == 1)
+            #create_new_original_examples
+        answer_span_losses = None
+        if self.answer_extraction:
+            span_loss, start_logits, end_logits = extract_answer(r_relevance_ids)
+            retvals['span_logits'] = [start_logits, end_logits]
+
+            if self.answer_verification:
+                import numpy as np
+                start_idx = np.argmax(start_logits.cpu().detach(), axis=1)
+                end_idx = np.argmax(end_logits.cpu().detach(), axis=1)
+                answer_span_losses = torch.zeros(input_ids.shape[0], device=input_ids.device)
+                for idx, (example, mapping) in enumerate(original_examples):
+                    question = example.text_a
+                    response = example.text_b
+                    response_start = (token_type_ids[idx] == 1).nonzero()[0].item()
+                        
+                    if start_idx[idx] < response_start \
+                        or end_idx[idx] >= len(mapping) \
+                        or start_idx[idx] > end_idx[idx]:
+                        answer_span_losses[idx] = -1
+                        continue
+                    answer_span_start = mapping[start_idx[idx]-response_start]
+                    answer_span_end = mapping[end_idx[idx]-response_start]
+                    answer = response[answer_span_start: answer_span_end+1]
+                    statement = self.qa2d.to_statement(question.split(), answer)#qa2d.format_answer_tokens(ngram))
+                    #answer_span_losses[idx] = 0 if example.r_relevant else 20
+                    answer_span_losses[idx] = self.lm.score(statement, answer)
+
+        if self.r_relevance:
+            # it's 2x more likely that a response is valid
+            r_loss, r_logits = classify_confusion('r', weighting=[1,2], answer_span_loss=answer_span_losses)
+            retvals['r_logits'] = r_logits
+            
+        retvals['loss'] = q_loss + r_loss + span_loss
+        return tuple([retvals[key] for key in sorted(retvals)])
+
