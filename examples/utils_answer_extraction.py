@@ -8,6 +8,7 @@ import math
 import collections
 from io import open
 import pandas as pd
+import numpy as np
 
 from transformers.tokenization_bert import BasicTokenizer, whitespace_tokenize
 
@@ -22,10 +23,8 @@ class InputExample(object):
         self.example_id = kwargs['index']
         self.question = kwargs['question']
         self.response = kwargs['response_filtered']
-        #print("RESPONSE:", self.response)
         self.q_relevant = kwargs['q_relevant']
         self.r_relevant = kwargs['r_relevant']
-        #self.answer = kwargs['answer']
         self.span = kwargs['span']
         
     def __str__(self):
@@ -46,7 +45,7 @@ class InputFeatures(object):
         for key, value in kwargs.items():
             setattr(self, key, value)
 
-def read_instagram_examples(input_file, is_training):
+def read_instagram_examples(input_file):
     """Read a .csv file"""
     df = pd.read_csv(input_file)
     df['span'] = df.answer_intersection_span.apply(lambda x: pd.eval(x) if not pd.isna(x) else None)
@@ -67,7 +66,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
         if example.response:
             orig_to_tok_start_index = []
             orig_to_tok_end_index = []
-            tok_to_orig_index = []#*list(range(len(tokens_a)+2))]
+            tok_to_orig_index = []
             tokens_b = []
             for (i, token) in enumerate(example.response):
                 sub_tokens = tokenizer.tokenize(token)
@@ -189,5 +188,5 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length):
                               r_relevance_label_id=r_relevant_label_id,
                               ans_start_idx=ans_start_idx,
                               ans_end_idx=ans_end_idx))
-        token_mapping[ex_index] = tok_to_orig_index
+        token_mapping[example.example_id] = tok_to_orig_index
     return features, token_mapping

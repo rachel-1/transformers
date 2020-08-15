@@ -24,6 +24,7 @@ import random
 import glob
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
@@ -113,6 +114,7 @@ def train(args, train_dataset, model, tokenizer):
 
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
+    last_eval_loss = float('inf')
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
@@ -121,28 +123,7 @@ def train(args, train_dataset, model, tokenizer):
         for step, batch in enumerate(epoch_iterator):
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            example_ids = batch[0]
-            inputs = {'input_ids'  :   batch[1],
-                      'attention_mask' :   batch[2],
-                      'token_type_ids':   batch[3]}
-
-            start_pos_ids, end_pos_ids = None, None
-            count = 4
-            if args.q_relevance:
-                inputs['q_relevance_ids'] = batch[count]
-                count += 1
-            if args.r_relevance:
-                inputs['r_relevance_ids'] = batch[count]
-                count += 1
-            if args.answer_extraction:
-                inputs['start_positions'], inputs['end_positions'] = batch[count:]
-
-            if args.model_type != 'distilbert':
-                inputs['token_type_ids'] = None if args.model_type == 'xlm' else inputs['token_type_ids']
-            if args.model_type in ['xlnet', 'xlm']:
-                inputs.update({'cls_index': batch[5],
-                               'p_mask':       batch[6]})
-
+            example_ids, inputs = unpack_batch(args, batch)
             outputs = model(**inputs)
 
             def list_to_dict(output):
@@ -171,6 +152,7 @@ def train(args, train_dataset, model, tokenizer):
             else:
                 loss.backward()
 
+            logger.info("Train loss: %f", loss.item())
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
@@ -185,10 +167,10 @@ def train(args, train_dataset, model, tokenizer):
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
-                    if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
-                        for key, value in results.items():
-                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+                    if args.local_rank == -1:  # Only evaluate when single GPU otherwise metrics may not average well
+                        eval_loss = evaluate(args, model, tokenizer)[0]
+                        logger.info("Eval loss: %f", eval_loss)
+                        tb_writer.add_scalar('eval_loss', eval_loss, global_step)
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
                     logging_loss = tr_loss
@@ -200,6 +182,13 @@ def train(args, train_dataset, model, tokenizer):
                         os.makedirs(output_dir)
                     model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
                     model_to_save.save_pretrained(output_dir)
+                    # Log metrics
+                    if args.local_rank == -1 and eval_loss < last_eval_loss:
+                        last_eval_loss = eval_loss
+                        output_dir = os.path.join(args.output_dir, 'best')
+                        if not os.path.exists(output_dir):
+                            os.makedirs(output_dir)
+                        model_to_save.save_pretrained(output_dir)
                     torch.save(args, os.path.join(output_dir, 'training_args.bin'))
                     logger.info("Saving model checkpoint to %s", output_dir)
 
@@ -217,7 +206,7 @@ def train(args, train_dataset, model, tokenizer):
 
 
 def evaluate(args, model, tokenizer, prefix=""):
-    dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True)
+    dataset, features, token_mapping = load_and_cache_examples(args, tokenizer, evaluate=True, output_features=True)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir)
@@ -231,59 +220,137 @@ def evaluate(args, model, tokenizer, prefix=""):
     logger.info("***** Running evaluation {} *****".format(prefix))
     logger.info("  Num examples = %d", len(dataset))
     logger.info("  Batch size = %d", args.eval_batch_size)
-    all_results = []
+    df = pd.DataFrame()
+    total_loss = 0
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
         with torch.no_grad():
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1]
-                      }
-            if args.model_type != 'distilbert':
-                inputs['token_type_ids'] = None if args.model_type == 'xlm' else batch[2]  # XLM don't use segment_ids
-            example_indices = batch[3]
-            if args.model_type in ['xlnet', 'xlm']:
-                inputs.update({'cls_index': batch[4],
-                               'p_mask':    batch[5]})
+            example_indices, inputs = unpack_batch(args, batch)
             outputs = model(**inputs)
+            def list_to_dict(output):
+                retval = {}
+                keys = ['loss']
+                if args.q_relevance: keys += ['q_logits']
+                if args.r_relevance: keys += ['r_logits']
+                if args.answer_extraction: keys += ['span_logits']
+                count = 0
+                for key in sorted(keys):
+                    retval[key] = output[count]
+                    count += 1
+                return retval
+                
+            output = list_to_dict(outputs)
+            total_loss += output['loss'].mean().item() if type(output['loss']) is not int else output['loss']
 
-        for i, example_index in enumerate(example_indices):
-            eval_feature = features[example_index.item()]
-            unique_id = int(eval_feature.unique_id)
-            if args.model_type in ['xlnet', 'xlm']:
-                # XLNet uses a more complex post-processing procedure
-                result = RawResultExtended(unique_id            = unique_id,
-                                           start_top_log_probs  = to_list(outputs[0][i]),
-                                           start_top_index      = to_list(outputs[1][i]),
-                                           end_top_log_probs    = to_list(outputs[2][i]),
-                                           end_top_index        = to_list(outputs[3][i]),
-                                           cls_logits           = to_list(outputs[4][i]))
-            else:
-                result = RawResult(unique_id    = unique_id,
-                                   start_logits = to_list(outputs[0][i]),
-                                   end_logits   = to_list(outputs[1][i]))
-            all_results.append(result)
+            # unpack outputs
+            if args.q_relevance:
+                q_logits = output['q_logits'].detach().cpu()
+                q_relevance_label_ids = inputs['q_relevance_ids'].cpu().numpy()
+                #metrics['q_relevance_auroc'] += auroc(q_logits, q_relevance_label_ids)
+                #metrics['q_relevance_accuracy'] += accuracy(q_logits.numpy(), q_relevance_label_ids)
+            if args.r_relevance:
+                r_logits = output['r_logits'].detach().cpu()
+                r_relevance_label_ids = inputs['r_relevance_ids'].cpu().numpy()
+                #metrics['r_relevance_auroc'] += auroc(r_logits, r_relevance_label_ids)
+                #metrics['r_relevance_accuracy'] += accuracy(r_logits.numpy(), r_relevance_label_ids)
+            if args.answer_extraction:
+                start_logits, end_logits = output['span_logits']
+                start_pos_ids = inputs['start_positions'].cpu().numpy()
+                end_pos_ids = inputs['end_positions'].cpu().numpy()
+                start_logits = start_logits.detach().cpu()
+                end_logits = end_logits.detach().cpu()
+                start_idx = np.argmax(start_logits, axis=1)
+                end_idx = np.argmax(end_logits, axis=1)
 
-    return results
+            response_starts = torch.LongTensor((inputs['token_type_ids'].shape[0]))
+            
+            for idx in range(inputs['token_type_ids'].shape[0]):
+                response_start = (inputs['token_type_ids'][idx] == 1).nonzero()[0].item()
+                response_starts[idx] = response_start
+                idx_batch = example_indices.cpu().numpy()
+                cols = []
+                data = np.array([]).reshape(idx_batch.shape[0], 0)
+            if args.q_relevance:
+                q_prediction = np.expand_dims(np.argmax(q_logits, axis=1).numpy(), 1)
+                data = np.hstack([data, q_logits.numpy(), q_prediction])
+                cols.extend(['q_score_0', 'q_score_1', 'q_prediction'])
+            if args.r_relevance:
+                r_prediction = np.expand_dims(np.argmax(r_logits, axis=1).numpy(), 1)
+                data = np.hstack([data, r_logits.numpy(), r_prediction])
+                cols.extend(['r_score_0', 'r_score_1', 'r_prediction'])
+            if args.answer_extraction:
+                start_idx -= response_starts
+                end_idx -= response_starts
+                data = np.hstack([data, np.expand_dims(start_idx,1), np.expand_dims(end_idx,1)])
+                cols.extend(['raw_span_start', 'raw_span_end'])
+            batch_df = pd.DataFrame(data, index=idx_batch, columns=cols)
+            df = df.append(batch_df)
+            
+        def convert_span(row):
+            tok_to_orig = token_mapping[row.name]
+            try:
+                if row.raw_span_start <= row.raw_span_end:
+                    return (tok_to_orig[int(row.raw_span_start)], tok_to_orig[int(row.raw_span_end)])
+                else:
+                    return None
+            except Exception as e:
+                print("Error converting span:", e)
+                return None
+
+    if args.q_relevance:
+        df['q_prediction'] = df.q_prediction.apply(lambda x: True if x == 0 else False)
+        
+    if args.r_relevance:
+        df['r_prediction'] = df.r_prediction.apply(lambda x: True if x == 0 else False)
+        
+    if args.answer_extraction:
+        df['pred_span'] = df.apply(lambda x: convert_span(x), axis=1)
+            
+    return total_loss / len(eval_dataloader), df
+
+def unpack_batch(args, batch):
+    example_ids = batch[0]
+    inputs = {'input_ids'  :   batch[1],
+              'attention_mask' :   batch[2],
+              'token_type_ids':   batch[3]}
+
+    start_pos_ids, end_pos_ids = None, None
+    count = 4
+    if args.q_relevance:
+        inputs['q_relevance_ids'] = batch[count]
+        count += 1
+    if args.r_relevance:
+        inputs['r_relevance_ids'] = batch[count]
+        count += 1
+    if args.answer_extraction:
+        inputs['start_positions'], inputs['end_positions'] = batch[count:]
+
+    if args.model_type != 'distilbert':
+        inputs['token_type_ids'] = None if args.model_type == 'xlm' else inputs['token_type_ids']
+    if args.model_type in ['xlnet', 'xlm']:
+        inputs.update({'cls_index': batch[5],
+                       'p_mask': batch[6]})
+
+    return example_ids, inputs
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
+def load_and_cache_examples(args, tokenizer, evaluate=False, output_features=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Load data features from cache or dataset file
-    input_file = args.predict_file if evaluate else args.train_file
+    input_file = args.eval_file if evaluate else args.train_file
     cached_features_file = os.path.join(os.path.dirname(input_file), 'cached_{}_{}_{}'.format(
         'dev' if evaluate else 'train',
         list(filter(None, args.model_name_or_path.split('/'))).pop(),
         str(args.max_seq_length)))
-    if os.path.exists(cached_features_file) and not args.overwrite_cache and not output_examples:
+    if os.path.exists(cached_features_file) and not args.overwrite_cache and not output_features:
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
     else:
         logger.info("Creating features from dataset file at %s", input_file)
-        examples = read_instagram_examples(input_file=input_file,
-                                                is_training=not evaluate)
+        examples = read_instagram_examples(input_file=input_file)
         features, token_mapping = convert_examples_to_features(examples=examples,
                                                 tokenizer=tokenizer,
                                                 max_seq_length=args.max_seq_length)
@@ -310,14 +377,17 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         tensors.append(torch.tensor([f.ans_start_idx for f in features], dtype=torch.long))
         tensors.append(torch.tensor([f.ans_end_idx for f in features], dtype=torch.long))
 
-    return TensorDataset(*tensors)
+    if output_features:
+        return TensorDataset(*tensors), features, token_mapping
+    else:
+        return TensorDataset(*tensors)
 
 def main():
     parser = argparse.ArgumentParser()
-
-    ## Required parameters
-    parser.add_argument("--train_file", default=None, type=str, required=True,
+    parser.add_argument("--train_file", default=None, type=str, required=False,
                         help=".csv for training")
+    parser.add_argument("--eval_file", default=None, type=str, required=False,
+                        help=".csv for eval")
     parser.add_argument("--model_type", default='bert', type=str, required=False,
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
     parser.add_argument("--model_name_or_path", default="bert-base-uncased", type=str, required=False,
@@ -325,7 +395,6 @@ def main():
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model checkpoints and predictions will be written.")
 
-    ## Other parameters
     parser.add_argument("--config_name", default="", type=str,
                         help="Pretrained config name or path if not the same as model_name")
     parser.add_argument("--tokenizer_name", default="", type=str,
@@ -349,8 +418,6 @@ def main():
                         help="Whether is will be necessary to handle answers deemed as irrelevant.")
     parser.add_argument("--answer_extraction", action='store_true',
                         help="Whether or not to actually extract the relevant answer.")
-    parser.add_argument("--evaluate_during_training", action='store_true',
-                        help="Rul evaluation during training at each logging step.")
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
@@ -399,6 +466,7 @@ def main():
     parser.add_argument('--server_ip', type=str, default='', help="Can be used for distant debugging.")
     parser.add_argument('--server_port', type=str, default='', help="Can be used for distant debugging.")
     args = parser.parse_args()
+
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
@@ -461,7 +529,7 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
+        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_features=False)
         global_step, tr_loss = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
@@ -487,15 +555,18 @@ def main():
         model.to(args.device)
 
 
-    # TODO
     # Evaluation - we can ask to evaluate all the checkpoints (sub-directories) in a directory
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
         checkpoints = [args.output_dir]
         if args.eval_all_checkpoints:
-            checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+            print("EVAL")
+            print(args.output_dir + '/**/' + WEIGHTS_NAME)
+            #checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+            #checkpoints = [os.path.join(args.output_dir, WEIGHTS_NAME)]
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce model loading logs
 
+        logger.info("WEIGHTS %s", WEIGHTS_NAME)
         logger.info("Evaluate the following checkpoints: %s", checkpoints)
 
         for checkpoint in checkpoints:
@@ -505,14 +576,9 @@ def main():
             model.to(args.device)
 
             # Evaluate
-            result = evaluate(args, model, tokenizer, prefix=global_step)
-
-            result = dict((k + ('_{}'.format(global_step) if global_step else ''), v) for k, v in result.items())
-            results.update(result)
-
-    logger.info("Results: {}".format(results))
-
-    return results
+            loss, df = evaluate(args, model, tokenizer, prefix=global_step)
+            logger.info("Eval loss: %d", loss)
+            df.to_csv(os.path.join(checkpoint, '{}-eval.csv'.format(global_step)))
 
 
 if __name__ == "__main__":

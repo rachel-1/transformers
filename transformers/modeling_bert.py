@@ -1163,7 +1163,6 @@ class BertForVQR(BertPreTrainedModel):
         self.q_relevance = q_relevance
         self.r_relevance = r_relevance
         self.answer_extraction = answer_extraction
-        self.answer_verification = answer_verification
 
         if self.q_relevance:
             self.q_relevance_classifier = nn.Linear(config.hidden_size, num_labels)
@@ -1171,20 +1170,13 @@ class BertForVQR(BertPreTrainedModel):
             self.r_relevance_classifier = nn.Linear(config.hidden_size, num_labels)
         if self.answer_extraction:
             self.span_classifier = nn.Linear(config.hidden_size, 2)
-        if self.answer_verification:
-            from preprocessing.restate_questions import QA2D
-            from preprocessing.language_modeling import MaskedLM
-            self.qa2d = QA2D()
-            self.lm = MaskedLM()
-            self.loss_multiplier = nn.Parameter(torch.tensor(0.1))
-            self.loss_bias = nn.Parameter(torch.tensor(-1.0))
-        #self.apply(self.init_bert_weights)
+
         self.init_weights()
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
                 q_relevance_ids=None, r_relevance_ids=None,
                 start_positions=None, end_positions=None, original_examples=None):
-        output = self.bert(input_ids, attention_mask, token_type_ids)#, output_all_encoded_layers=False)
+        output = self.bert(input_ids, attention_mask, token_type_ids)
         encoded_layers, pooled_output = output
 
         def classify_confusion(input_type='r', weighting=[1,1], answer_span_loss=None):
@@ -1230,7 +1222,6 @@ class BertForVQR(BertPreTrainedModel):
                 tmp_start_positions = start_positions.clamp(0, ignored_index)
                 tmp_end_positions = end_positions.clamp(0, ignored_index)
 
-                #loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
                 loss_fct = CrossEntropyLoss(reduction='none', ignore_index=ignored_index)
                 start_loss = loss_fct(start_logits, tmp_start_positions)
                 end_loss = loss_fct(end_logits, tmp_end_positions)
@@ -1248,36 +1239,10 @@ class BertForVQR(BertPreTrainedModel):
             q_loss, q_logits = classify_confusion('q', weighting=[1,3])
             retvals['q_logits'] = q_logits
 
-            # determine if the question is valid TODO
-            # if q invalid, rerun over "what is in the image?"
-            #invalid_qs = torch.where(q_relevance_ids == 1)
-            #create_new_original_examples
         answer_span_losses = None
         if self.answer_extraction:
             span_loss, start_logits, end_logits = extract_answer(r_relevance_ids)
             retvals['span_logits'] = [start_logits, end_logits]
-
-            if self.answer_verification:
-                import numpy as np
-                start_idx = np.argmax(start_logits.cpu().detach(), axis=1)
-                end_idx = np.argmax(end_logits.cpu().detach(), axis=1)
-                answer_span_losses = torch.zeros(input_ids.shape[0], device=input_ids.device)
-                for idx, (example, mapping) in enumerate(original_examples):
-                    question = example.text_a
-                    response = example.text_b
-                    response_start = (token_type_ids[idx] == 1).nonzero()[0].item()
-                        
-                    if start_idx[idx] < response_start \
-                        or end_idx[idx] >= len(mapping) \
-                        or start_idx[idx] > end_idx[idx]:
-                        answer_span_losses[idx] = -1
-                        continue
-                    answer_span_start = mapping[start_idx[idx]-response_start]
-                    answer_span_end = mapping[end_idx[idx]-response_start]
-                    answer = response[answer_span_start: answer_span_end+1]
-                    statement = self.qa2d.to_statement(question.split(), answer)#qa2d.format_answer_tokens(ngram))
-                    #answer_span_losses[idx] = 0 if example.r_relevant else 20
-                    answer_span_losses[idx] = self.lm.score(statement, answer)
 
         if self.r_relevance:
             # it's 2x more likely that a response is valid
@@ -1285,5 +1250,5 @@ class BertForVQR(BertPreTrainedModel):
             retvals['r_logits'] = r_logits
             
         retvals['loss'] = q_loss + r_loss + span_loss
-        return tuple([retvals[key] for key in sorted(retvals)])
+        return tuple([retvals[key] for key in sorted(retvals.keys())])
 
